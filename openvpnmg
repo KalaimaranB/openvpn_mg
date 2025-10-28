@@ -1,0 +1,429 @@
+#!/bin/bash
+#
+# openvpnmg - OpenVPN Management Script (improved)
+#  - Adds safer process detection, log verification, rotation
+#  - Adds colorized status, --current, --edit, completion snippet
+#  - Validates config JSON schema on init
+#
+# Usage: openvpnmg [command] [options]
+# See --help for available commands.
+
+# --- Safety: do not set -e globally to preserve friendly errors ---
+# set -e
+
+# --- Colors for nicer output ---
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[0;34m"
+NC="\033[0m"
+
+# --- Configuration ---
+# Use the user's home directory, even when run with sudo
+if [ -n "$SUDO_USER" ]; then
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    USER_HOME=$HOME
+fi
+
+CONFIG_DIR="$USER_HOME/.config/openvpnmg"
+OVPN_DIR="$CONFIG_DIR/ovpn_files"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+LOG_DIR="/var/log/openvpn" # OpenVPN logs typically go here
+
+# How long to poll for OpenVPN initialization message (seconds)
+STARTUP_POLL_MAX=10
+STARTUP_POLL_INTERVAL=1
+
+# Pattern used to identify managed openvpn daemon processes
+# This targets `openvpn --config /path/to/file.ovpn --daemon` (or similar)
+PGREP_PATTERN="openvpn --config .*\.ovpn( |$|--daemon)"
+
+# --- Helper Functions ---
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [command] [options]
+
+Commands:
+  --add <file.ovpn> <alias>   Add a new OpenVPN file with an alias.
+  --remove <alias>            Remove an alias and its file (refuses if in-use).
+  --switch <alias>            Stop ALL active VPNs and start the one specified by <alias>.
+  --terminate                 Stop ALL currently active OpenVPN processes.
+  --list                      List all configured aliases and their file paths.
+  --status                    Show all active OpenVPN processes (colorized).
+  --current                   Show the currently active alias (if any).
+  --edit                      Open the config file in \$EDITOR (or nano).
+  --help, -h                  Show this help message.
+
+Examples:
+  $(basename "$0") --add ~/Downloads/tryhackme.ovpn thm_main
+  $(basename "$0") --switch thm_main
+  $(basename "$0") --terminate
+
+EOF
+}
+
+# Ensure config directory and file exist and validate schema
+init() {
+    mkdir -p "$OVPN_DIR"
+    # Create log dir; ignore permission errors (we'll continue)
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "Creating initial config file at $CONFIG_FILE..."
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        echo '{ "vpn_files": {} }' > "$CONFIG_FILE"
+        # Ensure non-root user owns the config directory when appropriate
+        if [ -n "$SUDO_USER" ]; then
+            chown -R "$SUDO_USER:$SUDO_USER" "$USER_HOME/.config" 2>/dev/null || true
+        fi
+    else
+        # Validate config schema: must be JSON and .vpn_files must be an object
+        if ! jq -e '.vpn_files | type=="object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo -e "${YELLOW}Warning:${NC} Config file appears corrupted or invalid JSON."
+            # Backup the bad config safely
+            backup="$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+            cp "$CONFIG_FILE" "$backup" 2>/dev/null || true
+            echo "Backed up old config to: $backup"
+            echo '{ "vpn_files": {} }' > "$CONFIG_FILE"
+            echo "Reset config to a clean state at $CONFIG_FILE"
+        fi
+    fi
+}
+
+# Check for dependencies
+check_deps() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}Error:${NC} 'jq' is not installed. Please install it to use this script."
+        echo "  e.g., sudo apt install jq  OR  sudo dnf install jq  OR  brew install jq"
+        exit 1
+    fi
+    if ! command -v openvpn &> /dev/null; then
+        echo -e "${RED}Error:${NC} 'openvpn' is not installed. Please install it."
+        exit 1
+    fi
+    if ! command -v pgrep &> /dev/null || ! command -v pkill &> /dev/null; then
+        echo -e "${RED}Error:${NC} 'pgrep'/'pkill' are required (procps)."
+        exit 1
+    fi
+}
+
+# Re-run the script with sudo if not already root (keeps args)
+check_rerun_as_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "This operation requires root privileges. Re-running with sudo..."
+        sudo "$0" "$@"
+        exit $?
+    fi
+    # If we're here, we are root.
+}
+
+# Terminate ALL active OpenVPN daemons (managed ones)
+terminate_ovpn() {
+    echo "Checking for existing OpenVPN processes..."
+    local PIDS
+    PIDS=$(pgrep -f "$PGREP_PATTERN" || true)
+
+    if [ -n "$PIDS" ]; then
+        echo -e "${YELLOW}Terminating all active OpenVPN daemons (PIDs: $(echo "$PIDS" | tr '\n' ' '))...${NC}"
+        # Graceful terminate
+        pkill -f "$PGREP_PATTERN"
+        # Wait up to 5 seconds
+        for i in {1..5}; do
+            if ! pgrep -f "$PGREP_PATTERN" > /dev/null; then
+                echo -e "${GREEN}All OpenVPN processes terminated.${NC}"
+                return 0
+            fi
+            sleep 1
+        done
+        echo -e "${YELLOW}Processes did not terminate gracefully. Sending SIGKILL...${NC}"
+        pkill -9 -f "$PGREP_PATTERN"
+        echo -e "${GREEN}All OpenVPN processes terminated.${NC}"
+    else
+        echo -e "${BLUE}No active OpenVPN process found.${NC}"
+    fi
+}
+
+# Helper: find pid(s) for a given config file path
+pids_for_path() {
+    local path="$1"
+    # look for processes containing the exact path
+    pgrep -f "openvpn --config $path" || pgrep -f "openvpn .*${path##*/}" || true
+}
+
+# --- Main Commands ---
+
+# Add a new VPN configuration
+cmd_add() {
+    local ovpn_file="$1"
+    local alias="$2"
+
+    if [ -z "$ovpn_file" ] || [ -z "$alias" ]; then
+        echo -e "${RED}Error:${NC} --add requires two arguments: <file.ovpn> <alias>"
+        usage
+        exit 1
+    fi
+
+    if [ ! -f "$ovpn_file" ]; then
+        echo -e "${RED}Error:${NC} File not found at $ovpn_file"
+        exit 1
+    fi
+
+    # Ensure alias not present
+    if jq -e ".vpn_files.\"$alias\"" "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} Alias '$alias' already exists. Use --remove first if you want to replace it."
+        exit 1
+    fi
+
+    # Copy the file to the managed directory
+    local new_path="$OVPN_DIR/$alias.ovpn"
+    cp "$ovpn_file" "$new_path" || { echo -e "${RED}Error:${NC} Failed to copy file."; exit 1; }
+    # ensure non-root ownership if possible
+    if [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER:$SUDO_USER" "$new_path" 2>/dev/null || true
+    fi
+
+    # Add the alias and new path to the JSON config
+    local tmp_json
+    tmp_json=$(jq --arg alias "$alias" --arg path "$new_path" '.vpn_files[$alias] = $path' "$CONFIG_FILE")
+    echo "$tmp_json" > "$CONFIG_FILE"
+
+    echo -e "${GREEN}Successfully added alias '$alias' pointing to $new_path${NC}"
+}
+
+# Remove a VPN configuration (refuse if in-use)
+cmd_remove() {
+    local alias="$1"
+
+    if [ -z "$alias" ]; then
+        echo -e "${RED}Error:${NC} --remove requires an <alias> argument."
+        usage
+        exit 1
+    fi
+
+    local file_path
+    file_path=$(jq -r --arg alias "$alias" '.vpn_files[$alias]' "$CONFIG_FILE")
+
+    if [ "$file_path" == "null" ] || [ -z "$file_path" ]; then
+        echo -e "${RED}Error:${NC} Alias '$alias' not found."
+        exit 1
+    fi
+
+    # Check if any running process is using that file
+    if pgrep -f "openvpn --config $file_path" >/dev/null 2>&1 || pgrep -f "openvpn .*${file_path##*/}" >/dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} OpenVPN appears to be using '$alias' ($file_path)."
+        echo "Please terminate the VPN first with --terminate or ensure no process uses that config."
+        exit 1
+    fi
+
+    # Remove the file if present
+    if [ -f "$file_path" ]; then
+        rm -f "$file_path"
+        echo -e "${GREEN}Removed file:${NC} $file_path"
+    else
+        echo -e "${YELLOW}Warning:${NC} Config file $file_path not found, but removing alias anyway."
+    fi
+
+    # Remove from JSON
+    local tmp_json
+    tmp_json=$(jq --arg alias "$alias" 'del(.vpn_files[$alias])' "$CONFIG_FILE")
+    echo "$tmp_json" > "$CONFIG_FILE"
+
+    echo -e "${GREEN}Successfully removed alias '$alias'.${NC}"
+}
+
+# List all configured VPNs
+cmd_list() {
+    echo -e "${BLUE}Configured OpenVPN Aliases:${NC}"
+    echo "---------------------------"
+    if [ "$(jq -r '.vpn_files | length' "$CONFIG_FILE")" -eq 0 ]; then
+        echo "No aliases configured. Use --add to add one."
+        return
+    fi
+    jq -r '.vpn_files | to_entries[] | "\(.key)\t=> \(.value)"' "$CONFIG_FILE"
+}
+
+# Show active VPN status (colorized)
+cmd_status() {
+    echo -e "${BLUE}Checking OpenVPN status...${NC}"
+    local PIDS
+    PIDS=$(pgrep -f "$PGREP_PATTERN" || true)
+
+    if [ -n "$PIDS" ]; then
+        echo -e "${GREEN}Active OpenVPN process(es) found:${NC}"
+        # format the pid list for ps
+        local pid_list
+        pid_list=$(echo "$PIDS" | tr '\n' ',' | sed 's/,$//')
+        ps -o pid,cmd -p "$pid_list" | tail -n +2
+    else
+        echo -e "${YELLOW}No active OpenVPN process found.${NC}"
+    fi
+}
+
+# Show current active alias (if any)
+cmd_current() {
+    local pid
+    pid=$(pgrep -f "$PGREP_PATTERN" | head -n1 || true)
+    if [ -z "$pid" ]; then
+        echo -e "${YELLOW}No active VPN connection.${NC}"
+        return
+    fi
+
+    local cmdline
+    cmdline=$(ps -p "$pid" -o cmd --no-headers)
+    # try to extract the path to the .ovpn file from the cmdline
+    # first attempt: exact path after --config
+    local path
+    path=$(echo "$cmdline" | sed -n 's/.*--config[[:space:]]\+\([^ ]*\).*/\1/p')
+
+    if [ -z "$path" ]; then
+        # fallback: find any .ovpn filename in command line
+        path=$(echo "$cmdline" | grep -oE '/?[^ ]+\.ovpn' | head -n1 || true)
+    fi
+
+    local alias
+    if [ -n "$path" ]; then
+        alias=$(jq -r --arg path "$path" '.vpn_files | to_entries[] | select(.value == $path) | .key' "$CONFIG_FILE")
+    fi
+
+    if [ -n "$alias" ] && [ "$alias" != "null" ]; then
+        echo -e "${GREEN}Currently active:${NC} ${alias} (PID: ${pid})"
+    else
+        echo -e "${YELLOW}Active OpenVPN detected (PID: ${pid}), but alias not found in config.${NC}"
+        echo "Command: $cmdline"
+    fi
+}
+
+# Edit config with $EDITOR
+cmd_edit() {
+    ${EDITOR:-nano} "$CONFIG_FILE"
+    # after edit, validate schema
+    if ! jq -e '.vpn_files | type=="object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} Edited config appears invalid. Restoring backup..."
+        # attempt to restore from last backup if present
+        last_backup=$(ls -1 "$CONFIG_FILE".bak.* 2>/dev/null | tail -n1 || true)
+        if [ -n "$last_backup" ]; then
+            cp "$last_backup" "$CONFIG_FILE"
+            echo "Restored $last_backup -> $CONFIG_FILE"
+        else
+            echo "No backup found. Recreating a clean config."
+            echo '{ "vpn_files": {} }' > "$CONFIG_FILE"
+        fi
+    else
+        echo -e "${GREEN}Config edited and validated.${NC}"
+    fi
+}
+
+# Switch to a new VPN (terminates old one first)
+cmd_switch() {
+    local alias="$1"
+
+    if [ -z "$alias" ]; then
+        echo -e "${RED}Error:${NC} --switch requires an <alias> argument."
+        usage
+        exit 1
+    fi
+
+    local file_path
+    file_path=$(jq -r --arg alias "$alias" '.vpn_files[$alias]' "$CONFIG_FILE")
+
+    if [ "$file_path" == "null" ] || [ -z "$file_path" ]; then
+        echo -e "${RED}Error:${NC} Alias '$alias' not found in records."
+        exit 1
+    fi
+
+    if [ ! -f "$file_path" ]; then
+        echo -e "${RED}Error:${NC} Config file for alias '$alias' not found at $file_path."
+        echo "Please check your config file: $CONFIG_FILE"
+        exit 1
+    fi
+
+    # 1. Terminate any existing connection
+    terminate_ovpn
+
+    # 2. Rotate existing log if present
+    local log_file="$LOG_DIR/openvpn-$alias.log"
+    if [ -f "$log_file" ]; then
+        mv "$log_file" "${log_file}.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+    fi
+
+    # 3. Start the new connection
+    echo -e "${BLUE}Starting OpenVPN for '${alias}' from ${file_path}...${NC}"
+    echo "Logging output to $log_file"
+    # Start openvpn as daemon and log
+    openvpn --config "$file_path" --daemon --log "$log_file" 2>>"$log_file" || true
+
+    # 4. Verify it started by checking for the PID and the initialization message in log
+    local new_pid=""
+    for ((i=1; i<=STARTUP_POLL_MAX; i++)); do
+        # check for PID
+        new_pid=$(pgrep -f "openvpn --config $file_path" || true)
+        # check log for successful initialization sequence
+        if [ -n "$new_pid" ] && grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+            break
+        fi
+        sleep "$STARTUP_POLL_INTERVAL"
+    done
+
+    # Final check
+    if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
+        if grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+            echo -e "${GREEN}Successfully started OpenVPN for '${alias}' (PID: ${new_pid}).${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}Warning:${NC} OpenVPN process started (PID: ${new_pid}) but initialization message not seen in logs yet."
+            echo "Check $log_file for details."
+            return 1
+        fi
+    else
+        echo -e "${RED}Error:${NC} Failed to start OpenVPN for '${alias}'."
+        echo "Check log for details: $log_file"
+        return 1
+    fi
+}
+
+# --- Main Script Logic ---
+
+# Check dependencies first
+check_deps
+
+# Ensure config directories are set up and config is valid
+init
+
+# Parse command
+case "$1" in
+    --add)
+        cmd_add "$2" "$3"
+        ;;
+    --remove)
+        cmd_remove "$2"
+        ;;
+    --list)
+        cmd_list
+        ;;
+    --switch)
+        # This command requires root
+        check_rerun_as_root "$@"
+        # When re-run under sudo, we still want to call cmd_switch with alias
+        cmd_switch "$2"
+        ;;
+    --terminate)
+        # Needs root to kill other users' processes
+        check_rerun_as_root "$@"
+        terminate_ovpn
+        ;;
+    --status)
+        cmd_status
+        ;;
+    --current)
+        cmd_current
+        ;;
+    --edit)
+        cmd_edit
+        ;;
+    --help|-h|*)
+        usage
+        exit 0
+        ;;
+esac
