@@ -35,23 +35,26 @@ echo "✅ Installed $SCRIPT_NAME to $INSTALL_PATH"
 # 2. Autocompletion setup (optional)
 # ──────────────────────────────────────────────
 read -rp "Do you want to enable autocompletion for bash/zsh/fish? (y/n): " choice
+
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     mkdir -p "$AUTOCOMP_BASE"
 
     # --- Bash ---
-    if command -v bash >/dev/null; then
+    if command -v bash >/dev/null 2>&1; then
         cat >"$AUTOCOMP_BASE/openvpnmg.bash" <<'EOF'
 _openvpnmg_complete() {
     COMPREPLY=($(compgen -W "--add --remove --switch --list --terminate --status --help" -- "${COMP_WORDS[1]}"))
 }
 complete -F _openvpnmg_complete openvpnmg
 EOF
-        [[ -f ~/.bashrc ]] && echo "source $AUTOCOMP_BASE/openvpnmg.bash" >> ~/.bashrc
+        if [[ -f ~/.bashrc ]] && ! grep -q "source $AUTOCOMP_BASE/openvpnmg.bash" ~/.bashrc; then
+            echo "source $AUTOCOMP_BASE/openvpnmg.bash" >> ~/.bashrc
+        fi
         echo "✅ Bash completion added."
     fi
 
     # --- Zsh ---
-    if command -v zsh >/dev/null; then
+    if command -v zsh >/dev/null 2>&1; then
         cat >"$AUTOCOMP_BASE/_openvpnmg" <<'EOF'
 #compdef openvpnmg
 _arguments '--add[Add a VPN file]' '--remove[Remove a VPN alias]' '--switch[Switch VPN]' '--terminate[Terminate all VPNs]' '--list[List aliases]' '--status[Show status]' '--help[Show help]'
@@ -68,13 +71,14 @@ EOF
     fi
 
     # --- Fish ---
-    if command -v fish >/dev/null; then
+    if command -v fish >/dev/null 2>&1; then
         mkdir -p ~/.config/fish/completions
         cat >~/.config/fish/completions/openvpnmg.fish <<'EOF'
 complete -c openvpnmg -f -a "--add --remove --switch --terminate --list --status --help"
 EOF
         echo "✅ Fish completion added."
     fi
+
 else
     echo "❎ Skipping autocompletion setup."
 fi
